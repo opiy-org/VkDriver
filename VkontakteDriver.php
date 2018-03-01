@@ -6,25 +6,34 @@
  *
  */
 
-namespace App\Services\Chat\ChatDrivers;
+namespace App\Services\Chat\ChatDrivers\Vkontakte;
 
-use Mpociot\BotMan\Drivers\Driver;
-use Mpociot\BotMan\User;
-use Mpociot\BotMan\Answer;
-use Mpociot\BotMan\Message;
-use Mpociot\BotMan\Question;
+use Illuminate\Support\Collection;
+use App\Services\Chat\ChatDrivers\Vkontakte\VkontakteUser as User;
+use BotMan\BotMan\Drivers\HttpDriver;
+use BotMan\BotMan\Messages\Incoming\Answer;
+use BotMan\BotMan\Messages\Outgoing\OutgoingMessage;
+use BotMan\BotMan\Messages\Outgoing\Question;
+use Symfony\Component\HttpFoundation\ParameterBag;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Mpociot\BotMan\Messages\Message as IncomingMessage;
+use BotMan\BotMan\Messages\Incoming\IncomingMessage;
+use BotMan\BotMan\Messages\Attachments\File;
+use BotMan\BotMan\Messages\Attachments\Audio;
+use BotMan\BotMan\Messages\Attachments\Location;
+use BotMan\BotMan\Messages\Attachments\Image;
+use BotMan\BotMan\Messages\Attachments\Video;
 
-class VkontakteDriver extends Driver
+class VkontakteDriver extends HttpDriver
 {
 
 
-    protected $vkontakteProfileEndpoint = 'https://api.vk.com/method/users.get?v=5.0&user_ids=';
+    protected $vkontakteProfileEndpoint = 'https://api.vk.com/method/users.get?v=5.680&user_ids=';
 
     const DRIVER_NAME = 'Vkontakte';
     protected $myData = [];
+
+    protected $endpoint = 'messages.send';
 
     /**
      * @param Request $request
@@ -32,11 +41,77 @@ class VkontakteDriver extends Driver
      */
     public function buildPayload(Request $request)
     {
-        // This method receives the incoming HTTP Request and allows you
-        // to read the driver relevant information from it.
+        $this->payload = new ParameterBag($request->request->all());
         $this->myData = $request->request->all();
+        $this->event = Collection::make($this->payload->get('object'));
+        $this->config = Collection::make($this->config->get('vkontakte'));
         //   \Log::debug('Driver buildPayload: mydata' . print_r($this->myData, true));
     }
+
+    /**
+     * Retrieve User information.
+     * ++
+     * @param IncomingMessage $matchingMessage
+     * @return User|bool
+     */
+    public function getUser(IncomingMessage $matchingMessage)
+    {
+        $udata = [];
+        $resp = $this->sendRequest('users.get', [
+            'user_ids' => $matchingMessage->getSender(),
+            'fields' => 'screen_name,sex,bdate,city,country,contacts',
+        ]);
+
+        if ((!$resp) or (!$resp->isOk())) return false;
+        $resp_data = json_decode($resp->getContent(), true);
+
+
+        $profileData = array_get($resp_data, 'response.0');
+
+        $id = array_get($profileData, 'id', null);
+        $firstName = array_get($profileData, 'name', null);
+        $lastName = array_get($profileData, 'last_name', null);
+        $uname = array_get($profileData, 'screen_name', null);
+
+        if ($uname === null) {
+            $uname = strlen(trim($firstName . $lastName)) > 0 ? trim($firstName . $lastName) : $id;
+        }
+
+        $sex = array_get($profileData, 'sex', null);
+        if ($sex != null) {
+            $udata['gender'] = ($sex == 2) ? 'male' : 'female';
+        }
+
+        $bdate = array_get($profileData, 'bdate', null);
+        if ($bdate != null) {
+            $age = date('Y') - date('Y', strtotime($bdate));
+            $udata['age'] = $age;
+        }
+
+        $city = array_get($profileData, 'city.title', null);
+        if ($city != null) {
+            $udata['city'] = $city;
+        }
+
+        $country = array_get($profileData, 'country.title', null);
+        if ($country != null) {
+            $udata['country'] = $country;
+        }
+
+        $mobile_phone = array_get($profileData, 'mobile_phone', null);
+        if ($mobile_phone != null) {
+            $udata['additional_phone'] = $mobile_phone;
+        }
+
+        $home_phone = array_get($profileData, 'home_phone', null);
+        if ($home_phone != null) {
+            $udata['home_phone'] = $home_phone;
+        }
+
+
+        return new User($matchingMessage->getSender(), $firstName, $lastName, $uname, $udata);
+    }
+
 
     /**
      * Determine if the request is for this driver.
@@ -45,10 +120,29 @@ class VkontakteDriver extends Driver
      */
     public function matchesRequest()
     {
-        $check = isset($this->myData['object']) && isset($this->myData['type']) && ($this->myData['type'] == 'message_new');
+        $check = ((array_get($this->myData, 'type', null)) === 'message_new');
+
+        // \Log::debug('mydata: ' . print_r($this->myData, true));
+
+        $attachs = array_get($this->myData, 'object.attachments', []);
+        if (count($attachs) > 0) {
+            $check = false;
+        }
+
         // This method detects if the incoming HTTP request should be handled with this driver class.
         return $check;
 
+    }
+
+    /**
+     * @param IncomingMessage $matchingMessage
+     *
+     * @return Answer
+     */
+    public function getConversationAnswer(IncomingMessage $matchingMessage)
+    {
+        // Return the given answer, when inside a conversation.
+        return Answer::create($matchingMessage->getText())->setMessage($matchingMessage);
     }
 
 
@@ -59,10 +153,15 @@ class VkontakteDriver extends Driver
      */
     public function getMessages()
     {
-        $message = [new Message($this->myData['object']['body'], $this->myData['group_id'], $this->myData['object']['user_id'])];
+        $sender = array_get($this->myData, 'object.user_id');
+        $recipient = array_get($this->myData, 'group_id');
+        $text = array_get($this->myData, 'object.body');
+
+
+        $messages = [new IncomingMessage($text, $sender, $recipient, $this->event)];
         // \Log::debug('Driver getMessages: ' . print_r($message, true));
         // Return the message(s) that are inside the incoming request.
-        return $message;
+        return $messages;
     }
 
     /**
@@ -75,54 +174,57 @@ class VkontakteDriver extends Driver
 
 
     /**
-     * @param Message $matchingMessage
-     *
-     * @return Answer
-     */
-    public function getConversationAnswer(Message $matchingMessage)
-    {
-        // Return the given answer, when inside a conversation.
-        return Answer::create($matchingMessage->getMessage());
-    }
-
-    /**
-     * @param string|Question $message
-     * @param Message $matchingMessage
-     * @param array $additionalParameters
-     * @return $this
-     */
-    public function reply($message, $matchingMessage, $additionalParameters = [])
-    {
-        // Send a reply to the messaging service.
-        // Replies can either be strings, Question objects or IncomingMessage objects.
-        if ($message instanceof Question) {
-            $additionalParameters['message'] = $message->getText();
-        } elseif ($message instanceof IncomingMessage) {
-            $additionalParameters['message'] = $message->getMessage();
-        } else {
-            $additionalParameters['message'] = $message;
-        }
-
-        $additionalParameters['user_id'] = $matchingMessage->getChannel();
-        $additionalParameters['access_token'] = $this->config->get('vkontakte_token');
-        $this->http->get('https://api.vk.com/method/messages.send', $additionalParameters);
-    }
-
-
-    /**
-     * @param Message $matchingMessage
+     * @param IncomingMessage $matchingMessage
      * @return \Symfony\Component\HttpFoundation\Response
      */
-    public function types(Message $matchingMessage)
+    public function types(IncomingMessage $matchingMessage)
     {
         $parameters = [
-            'user_id' => $matchingMessage->getChannel(),
-            'access_token' => $this->config->get('vkontakte_token'),
+            'user_id' => $matchingMessage->getSender(),
+            'access_token' => $this->config->get('token'),
             'type' => 'typing',
             'v' => '5.38',
         ];
 
         return $this->http->get('https://api.vk.com/method/messages.setActivity', $parameters);
+    }
+
+
+    /**
+     * @param string|Question|IncomingMessage $message
+     * @param \BotMan\BotMan\Messages\Incoming\IncomingMessage $matchingMessage
+     * @param array $additionalParameters
+     * @return Response
+     */
+    public function buildServicePayload($message, $matchingMessage, $additionalParameters = [])
+    {
+        $recipient = $matchingMessage->getSender();
+        $parameters = array_merge_recursive([
+            'user_id' => $recipient,
+            'access_token' => $this->config->get('token'),
+        ], $additionalParameters);
+
+        // Send a reply to the messaging service.
+        // Replies can either be strings, Question objects or IncomingMessage objects.
+        if ($message instanceof Question) {
+            $parameters['message'] = $message->getText();
+        } elseif ($message instanceof OutgoingMessage) {
+            $parameters['message'] = $message->getText();
+        } else {
+            $parameters['message'] = $message;
+        }
+
+        return $this->http->get('https://api.vk.com/method/messages.send', $parameters);
+    }
+
+    /**
+     * @param mixed $payload
+     * @return Response
+     */
+    public function sendPayload($payload)
+    {
+        return $this->http->get('https://api.vk.com/method/' . $this->endpoint, $payload);
+
     }
 
 
@@ -141,43 +243,24 @@ class VkontakteDriver extends Driver
      */
     public function isConfigured()
     {
-        return !is_null($this->config->get('vkontakte_token'));
+        return !is_null($this->config->get('token'));
     }
 
-    /**
-     * Retrieve User information.
-     * ++
-     * @param Message $matchingMessage
-     * @return User
-     */
-    public function getUser(Message $matchingMessage)
-    {
-        $profileData = $this->http->get($this->vkontakteProfileEndpoint . $matchingMessage->getChannel());
-        $profileData = json_decode($profileData->getContent())->response[0];
-
-        // \Log::debug('VK getUser' . print_r($profileData, true));
-
-        $firstName = isset($profileData->first_name) ? $profileData->first_name : null;
-        $lastName = isset($profileData->last_name) ? $profileData->last_name : null;
-        $uname = strlen(trim($firstName . $lastName)) > 0 ? trim($firstName . $lastName) : $profileData->id;
-
-        return new User($matchingMessage->getChannel(), $firstName, $lastName, $uname);
-    }
 
     /**
      * Low-level method to perform driver specific API requests.
      * ++
      * @param string $endpoint
      * @param array $parameters
-     * @param Message $matchingMessage
+     * @param IncomingMessage $matchingMessage
      * @return Response
      */
-    public function sendRequest($endpoint, array $parameters, Message $matchingMessage)
+    public function sendRequest($endpoint, array $parameters, IncomingMessage $matchingMessage = null)
     {
 
         $parameters = array_replace_recursive([
-            'access_token' => $this->config->get('vkontakte_token'),
-            'v' => '5.38',
+            'access_token' => $this->config->get('token'),
+            'v' => '5.68',
         ], $parameters);
 
         $request = $this->http->get('https://api.vk.com/method/' . $endpoint, $parameters);
